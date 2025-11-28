@@ -84,7 +84,13 @@ call install_timer_isr
 
 ; === GAME LOOP ===
 game_loop:
-    ; Check for key press FIRST (non-blocking)
+    ; Check if game over first
+    cmp byte [game_over], 1
+    jne game_not_over
+    jmp handle_game_over        ; Far jump
+game_not_over:
+
+    ; Check for key press (non-blocking)
     mov ah, 01h
     int 16h
     jz no_key_pressed           ; no key pressed
@@ -95,7 +101,9 @@ game_loop:
    
     ; Check if ESC pressed
     cmp ah, 01h         ; ESC scan code
-    je near exit_game
+    jne not_esc
+    jmp exit_game               ; Far jump
+not_esc:
    
     ; Check Right Arrow (scan code 4Dh)
     cmp ah, 4Dh
@@ -108,8 +116,7 @@ game_loop:
     jmp no_key_pressed
 
 handle_right:
-    mov al, [current_lane]
-    cmp al, 2           ; already in right lane?
+    cmp byte [current_lane], 2  ; already in right lane?
     jge no_key_pressed
    
     ; Erase old car position
@@ -129,8 +136,7 @@ handle_right:
     jmp no_key_pressed
 
 handle_left:
-    mov al, [current_lane]
-    cmp al, 0           ; already in left lane?
+    cmp byte [current_lane], 0  ; already in left lane?
     jle no_key_pressed
    
     ; Erase old car position
@@ -146,26 +152,21 @@ handle_left:
     mov bx, [car_x]
     mov cx, [car_y]
     call draw_car_sprite
-   
+
 no_key_pressed:
     ; CHECK IF IT'S TIME TO SCROLL
     cli                         ; disable interrupts while checking flag
     mov al, [scroll_ready]
-    cmp al, 1
-    jne skip_scroll_check
-    
-    ; Reset flag
-    mov byte [scroll_ready], 0
+    mov byte [scroll_ready], 0  ; Reset flag immediately
     sti                         ; re-enable interrupts
+    
+    cmp al, 1
+    jne skip_scroll_this_frame
     
     ; Scroll the screen
     call scroll_background_only
-    jmp after_scroll
     
-skip_scroll_check:
-    sti                         ; re-enable interrupts
-    
-after_scroll:
+skip_scroll_this_frame:
     ; Display score
     call display_score_ingame
     
@@ -173,41 +174,34 @@ after_scroll:
     call generate_obstacle
     call generate_bonus
    
-    ; Update positions
+    ; Update positions (this also erases old positions)
     call update_obstacle_position
     call update_bonus_position
+   
+    ; Check for collisions BEFORE drawing
+    call check_bonus_collision
+    call check_collision
    
     ; Draw player car
     mov bx, [car_x]
     mov cx, [car_y]
     call draw_car_sprite
    
-    ; Draw obstacle
-    mov al, [obstacle_active]
-    cmp al, 0
+    ; Draw obstacle if active
+    cmp byte [obstacle_active], 0
     je skip_draw_obs_loop
     mov bx, [obstacle_x]
     mov cx, [obstacle_y]
     call draw_obstacle_sprite
 skip_draw_obs_loop:
    
-    ; Draw bonus
-    mov al, [bonus_active]
-    cmp al, 0
+    ; Draw bonus if active
+    cmp byte [bonus_active], 0
     je skip_draw_bon_loop
     mov bx, [bonus_x]
     mov cx, [bonus_y]
     call draw_bonus_sprite
 skip_draw_bon_loop:
-   
-    ; Check for collision
-    call check_collision
-    call check_bonus_collision
-   
-    ; Check if game over
-    mov al, [game_over]
-    cmp al, 1
-    je handle_game_over
    
     ; Small delay for animation
     call delay
@@ -223,13 +217,14 @@ handle_game_over:
     call delay
     call delay
    
-    ; Jump to exit screen
-    jmp exit_game
+    ; Fall through to exit screen
+    jmp show_exit_screen
 
 ; === EXIT ===
 exit_game:
     call restore_timer_isr
-    
+
+show_exit_screen:
     ; Switch to text mode to show message
     mov ax, 3h
     int 10h              ; back to text mode
@@ -243,8 +238,7 @@ exit_game:
     int 10h
    
     ; Show game over if collision
-    mov al, [collision_detected]
-    cmp al, 1
+    cmp byte [collision_detected], 1
     jne skip_game_over_text
    
     mov dh, 8
@@ -375,8 +369,8 @@ print_number_text:
     int 10h
     
     ; Handle zero case
-    cmp ax, 0
-    jne convert_num_loop
+    test ax, ax
+    jnz do_convert_num
     
     mov ah, 0Eh
     mov al, '0'
@@ -384,18 +378,18 @@ print_number_text:
     int 10h
     jmp print_num_text_done
    
+do_convert_num:
     ; Convert number to string
-convert_num_loop:
     mov bx, 10
     mov cx, 0
    
-convert_num_loop2:
+convert_num_loop:
     xor dx, dx
     div bx
     push dx
     inc cx
     test ax, ax
-    jnz convert_num_loop2
+    jnz convert_num_loop
    
 print_num_loop:
     pop ax
@@ -571,7 +565,7 @@ delay:
     push dx
    
     mov cx, 1
-    mov dx, 8000h
+    mov dx, 6000h
 delay_loop:
     dec dx
     jnz delay_loop
@@ -590,14 +584,16 @@ erase_car:
     push di
     push si
     
-    ; Save parameters
-    mov si, bx          ; save X
+    ; BX = X position, CX = Y position
+    mov si, bx          ; save X in SI
    
     mov dx, 0           ; row counter
 erase_row:
-    ; Calculate screen position
+    ; Calculate screen Y position
     mov ax, cx          ; Y position
     add ax, dx          ; add row offset
+    cmp ax, 0
+    jl skip_erase_row
     cmp ax, 200         ; bounds check
     jge erase_car_done
     
@@ -608,10 +604,6 @@ erase_row:
     push cx
     mov cx, 0           ; column counter
 erase_col:
-        ; Calculate current X position
-        mov ax, si
-        add ax, cx
-        
         ; Default road color
         mov al, 7
        
@@ -628,18 +620,16 @@ erase_col:
 check_divider_erase:
         ; Check if this row should have a dash
         push ax
+        push bx
         push dx
         mov ax, [car_y]
         add ax, dx
-        push cx
-        push bx
         mov bx, 20
         xor dx, dx
         div bx
         cmp dx, 10
-        pop bx
-        pop cx
         pop dx
+        pop bx
         pop ax
         jge not_divider_erase
        
@@ -653,6 +643,7 @@ not_divider_erase:
         jl erase_col
     pop cx
    
+skip_erase_row:
     inc dx
     cmp dx, CAR_HEIGHT
     jl erase_row
@@ -675,6 +666,7 @@ erase_obstacle:
     push di
     push si
     
+    ; BX = X, CX = Y
     mov si, bx          ; save X
    
     mov dx, 0           ; row counter
@@ -695,35 +687,33 @@ erase_obs_row:
 erase_obs_col:
         mov al, 7       ; road color (grey)
        
-        mov bx, [obstacle_x]
+        mov bx, si
         add bx, cx
        
         cmp bx, 140
-        je check_obs_divider_erase
+        je check_obs_div_erase
         cmp bx, 180
-        je check_obs_divider_erase
-        jmp not_obs_divider_erase
+        je check_obs_div_erase
+        jmp not_obs_div_erase
        
-check_obs_divider_erase:
+check_obs_div_erase:
         push ax
+        push bx
         push dx
         mov ax, [obstacle_y]
         add ax, dx
-        push cx
-        push bx
         mov bx, 20
         xor dx, dx
         div bx
         cmp dx, 10
-        pop bx
-        pop cx
         pop dx
+        pop bx
         pop ax
-        jge not_obs_divider_erase
+        jge not_obs_div_erase
        
         mov al, 15      ; white dash
        
-not_obs_divider_erase:
+not_obs_div_erase:
         mov [es:di], al
         inc di
         inc cx
@@ -754,6 +744,7 @@ erase_bonus:
     push di
     push si
     
+    ; BX = X, CX = Y
     mov si, bx          ; save X
    
     mov dx, 0           ; row counter
@@ -774,35 +765,33 @@ erase_bon_row:
 erase_bon_col:
         mov al, 7       ; road color (grey)
        
-        mov bx, [bonus_x]
+        mov bx, si
         add bx, cx
        
         cmp bx, 140
-        je check_bon_divider_erase
+        je check_bon_div_erase
         cmp bx, 180
-        je check_bon_divider_erase
-        jmp not_bon_divider_erase
+        je check_bon_div_erase
+        jmp not_bon_div_erase
        
-check_bon_divider_erase:
+check_bon_div_erase:
         push ax
+        push bx
         push dx
         mov ax, [bonus_y]
         add ax, dx
-        push cx
-        push bx
         mov bx, 20
         xor dx, dx
         div bx
         cmp dx, 10
-        pop bx
-        pop cx
         pop dx
+        pop bx
         pop ax
-        jge not_bon_divider_erase
+        jge not_bon_div_erase
        
         mov al, 15      ; white dash
        
-not_bon_divider_erase:
+not_bon_div_erase:
         mov [es:di], al
         inc di
         inc cx
@@ -829,6 +818,7 @@ setup_palette:
     push ax
     push bx
     push cx
+    push dx
    
     ; color 2 = dark forest green
     mov al, 2
@@ -841,6 +831,13 @@ setup_palette:
     mov al, 3
     mov bh, 0
     mov bl, 45
+    mov ch, 0
+    call set_palette_color
+
+    ; color 4 = red (for player car)
+    mov al, 4
+    mov bh, 50
+    mov bl, 0
     mov ch, 0
     call set_palette_color
 
@@ -906,14 +903,8 @@ setup_palette:
     mov bl, 30
     mov ch, 55
     call set_palette_color
-    
-    ; color 4 = red (for player car)
-    mov al, 4
-    mov bh, 50
-    mov bl, 0
-    mov ch, 0
-    call set_palette_color
    
+    pop dx
     pop cx
     pop bx
     pop ax
@@ -945,14 +936,12 @@ show_intro_screen:
     push di
    
     ; Clear screen with dark blue background
-    mov cx, 0
-    mov di, 0
+    xor di, di
+    mov cx, 64000
 intro_clear:
-        mov byte [es:di], 1
-        inc di
-        inc cx
-        cmp cx, 64000
-        jl intro_clear
+    mov byte [es:di], 1
+    inc di
+    loop intro_clear
    
     ; Display title
     mov dh, 5
@@ -1116,23 +1105,19 @@ draw_road_borders:
     push dx
     push di
 
-    mov bx, 100
-    mov dx, 219
     mov cx, 0
 border_loop:
         mov di, cx
         imul di, 320
-        add di, bx
+        
+        ; Left border
         mov al, 14
-        mov [es:di], al
-        mov [es:di+1], al
+        mov [es:di+100], al
+        mov [es:di+101], al
 
-        mov di, cx
-        imul di, 320
-        add di, dx
-        mov al, 14
-        mov [es:di], al
-        mov [es:di-1], al
+        ; Right border
+        mov [es:di+218], al
+        mov [es:di+219], al
 
         inc cx
         cmp cx, 200
@@ -1167,12 +1152,11 @@ draw_dashed_line:
    
     mov cx, 0
 next_dash_y:
-        mov dx, bx
         mov si, 0
 dash_segment:
             mov di, cx
             imul di, 320
-            add di, dx
+            add di, bx
             mov al, 15
             mov [es:di], al
             inc si
@@ -1217,41 +1201,61 @@ draw_decorations:
     ret
 
 ; === DRAW CAR SPRITE ===
+; BX = X position, CX = Y position
 draw_car_sprite:
     push ax
+    push bx
+    push cx
     push dx
     push di
     push si
 
     mov si, car_sprite_data
-    mov dx, 0
+    mov dx, 0           ; row counter
 
 car_row:
-    mov di, cx
-    add di, dx
+    ; Calculate screen position
+    mov ax, cx
+    add ax, dx
+    cmp ax, 0
+    jl skip_car_row
+    cmp ax, 200
+    jge car_sprite_done
+    
+    mov di, ax
     imul di, 320
     add di, bx
 
-    mov ah, 0
+    push cx
+    mov cx, 0           ; column counter
 car_col:
         mov al, [si]
         cmp al, 0
-        je skip_pixel
+        je skip_car_pixel
         mov [es:di], al
-skip_pixel:
+skip_car_pixel:
         inc si
         inc di
-        inc ah
-        cmp ah, CAR_WIDTH
+        inc cx
+        cmp cx, CAR_WIDTH
         jl car_col
+    pop cx
+    jmp next_car_row
 
+skip_car_row:
+    add si, CAR_WIDTH   ; skip this row's data
+    
+next_car_row:
     inc dx
     cmp dx, CAR_HEIGHT
     jl car_row
 
+car_sprite_done:
     pop si
     pop di
     pop dx
+    pop cx
+    pop bx
     pop ax
     ret
 
@@ -1411,14 +1415,12 @@ generate_obstacle:
     push dx
    
     ; Check if obstacle already active
-    mov al, [obstacle_active]
-    cmp al, 1
+    cmp byte [obstacle_active], 1
     je skip_generate
    
     ; Counter-based spawning
     inc word [spawn_counter]
-    mov ax, [spawn_counter]
-    cmp ax, 80
+    cmp word [spawn_counter], 80
     jl skip_generate
    
     ; Reset counter and spawn
@@ -1434,7 +1436,7 @@ generate_obstacle:
     div cx
     mov [obstacle_lane], dl
    
-    ; Set X position based on lane (SAME as player: 107, 147, 187)
+    ; Set X position based on lane
     cmp dl, 0
     je set_obs_lane_0
     cmp dl, 1
@@ -1466,8 +1468,7 @@ update_obstacle_position:
     push bx
     push cx
    
-    mov al, [obstacle_active]
-    cmp al, 0
+    cmp byte [obstacle_active], 0
     je skip_update_obs_pos
     
     ; ERASE OLD POSITION FIRST
@@ -1475,12 +1476,11 @@ update_obstacle_position:
     mov cx, [obstacle_y]
     call erase_obstacle
    
-    ; Move down by 2 pixels (faster)
+    ; Move down by 2 pixels
     add word [obstacle_y], 2
    
     ; Check if off screen
-    mov ax, [obstacle_y]
-    cmp ax, 200
+    cmp word [obstacle_y], 200
     jl skip_update_obs_pos
    
     ; Passed player - increment score
@@ -1495,39 +1495,34 @@ skip_update_obs_pos:
     pop ax
     ret
 
-; === DRAW OBSTACLE CAR SPRITE (WITH BOUNDARY CHECKING) ===
+; === DRAW OBSTACLE CAR SPRITE ===
+; BX = X position, CX = Y position
 draw_obstacle_sprite:
     push ax
+    push bx
+    push cx
     push dx
     push di
     push si
-    push bx
-    push cx
-
-    ; Check if obstacle is within screen bounds
-    mov ax, cx              ; cx = obstacle_y
-    cmp ax, -32
-    jl skip_draw_obs_sprite
-    cmp ax, 200
-    jge skip_draw_obs_sprite
 
     mov si, obstacle_car_data
-    mov dx, 0
+    mov dx, 0           ; row counter
 
 obstacle_car_row:
-    ; Check if current row is within screen
+    ; Calculate screen Y position
     mov ax, cx
     add ax, dx
     cmp ax, 0
     jl skip_obstacle_row
     cmp ax, 200
-    jge skip_draw_obs_sprite
+    jge obstacle_sprite_done
 
     mov di, ax
     imul di, 320
     add di, bx
 
     push cx
+    push bx
     mov cx, 0           ; column counter
 obstacle_car_col:
         mov al, [si]
@@ -1536,64 +1531,56 @@ obstacle_car_col:
         cmp al, 0
         je skip_obstacle_pixel
         
-        ; Check if pixel is within road boundaries (X: 102 to 217)
-        push bx
-        add bx, cx
-        cmp bx, 102
-        jl skip_obs_pixel_pop
-        cmp bx, 217
-        jg skip_obs_pixel_pop
-        pop bx
+        ; Check if pixel is within road boundaries
+        mov ax, bx
+        add ax, cx
+        cmp ax, 102
+        jl skip_obstacle_pixel
+        cmp ax, 217
+        jg skip_obstacle_pixel
+        
+        ; Get back the pixel color
+        mov al, [si-1]
         
         ; Convert red colors to blue for obstacle
         cmp al, 12
         je use_dark_blue
         cmp al, 4
         je use_blue
-        jmp draw_obstacle_pixel
+        jmp draw_obs_pixel
        
 use_dark_blue:
         mov al, 1
-        jmp draw_obstacle_pixel
+        jmp draw_obs_pixel
 use_blue:
         mov al, 9
        
-draw_obstacle_pixel:
+draw_obs_pixel:
         mov [es:di], al
-        jmp continue_obstacle_pixel
-        
-skip_obs_pixel_pop:
-        pop bx
         
 skip_obstacle_pixel:
-continue_obstacle_pixel:
         inc di
         inc cx
         cmp cx, CAR_WIDTH
         jl obstacle_car_col
+    pop bx
     pop cx
+    jmp next_obstacle_row
 
 skip_obstacle_row:
-    ; Advance SI past remaining columns if we skipped the row
-    mov ax, cx
-    add ax, dx
-    cmp ax, 0
-    jge no_skip_si
-    add si, CAR_WIDTH
-    sub si, cx              ; Adjust if we partially processed
-    jmp after_si_adjust
-no_skip_si:
-after_si_adjust:
+    add si, CAR_WIDTH   ; skip this row's data
+    
+next_obstacle_row:
     inc dx
     cmp dx, CAR_HEIGHT
     jl obstacle_car_row
 
-skip_draw_obs_sprite:
-    pop cx
-    pop bx
+obstacle_sprite_done:
     pop si
     pop di
     pop dx
+    pop cx
+    pop bx
     pop ax
     ret
 
@@ -1640,12 +1627,10 @@ check_collision:
     push si
     push di
    
-    mov al, [obstacle_active]
-    cmp al, 0
+    cmp byte [obstacle_active], 0
     je no_collision
    
-    mov al, [collision_detected]
-    cmp al, 1
+    cmp byte [collision_detected], 1
     je no_collision
    
     ; Get player car bounds
@@ -1660,30 +1645,26 @@ check_collision:
     mov si, [obstacle_x]      ; obstacle left
     mov di, [obstacle_y]      ; obstacle top
    
-    ; Check for NO overlap (if any of these is true, no collision)
-    ; 1. Player right <= Obstacle left
+    ; Check for NO overlap
     cmp cx, si
     jle no_collision
    
-    ; 2. Player left >= Obstacle right
     push si
     add si, CAR_WIDTH
     cmp ax, si
     pop si
     jge no_collision
    
-    ; 3. Player bottom <= Obstacle top
     cmp dx, di
     jle no_collision
    
-    ; 4. Player top >= Obstacle bottom
     push di
     add di, CAR_HEIGHT
     cmp bx, di
     pop di
     jge no_collision
    
-    ; If we reach here, there IS a collision!
+    ; Collision detected!
     mov byte [collision_detected], 1
     mov byte [game_over], 1
    
@@ -1703,13 +1684,11 @@ generate_bonus:
     push cx
     push dx
    
-    mov al, [bonus_active]
-    cmp al, 1
+    cmp byte [bonus_active], 1
     je skip_gen_bonus
    
     inc word [bonus_counter]
-    mov ax, [bonus_counter]
-    cmp ax, 150
+    cmp word [bonus_counter], 150
     jl skip_gen_bonus
    
     mov word [bonus_counter], 0
@@ -1725,8 +1704,7 @@ generate_bonus:
     div cx
     mov [bonus_lane], dl
    
-    ; Set bonus position - centered in lane (bonus is 16px, car is 26px)
-    ; So we add (26-16)/2 = 5 pixels to center it
+    ; Set bonus position - centered in lane
     cmp dl, 0
     je set_bonus_lane_0
     cmp dl, 1
@@ -1760,8 +1738,7 @@ update_bonus_position:
     push bx
     push cx
    
-    mov al, [bonus_active]
-    cmp al, 0
+    cmp byte [bonus_active], 0
     je skip_update_bon_pos
     
     ; ERASE OLD POSITION FIRST
@@ -1773,8 +1750,7 @@ update_bonus_position:
     add word [bonus_y], 2
    
     ; Check if off screen
-    mov ax, [bonus_y]
-    cmp ax, 200
+    cmp word [bonus_y], 200
     jl skip_update_bon_pos
    
     ; Deactivate
@@ -1787,38 +1763,34 @@ skip_update_bon_pos:
     ret
 
 ; === DRAW BONUS SPRITE (Gold Star) ===
+; BX = X position, CX = Y position
 draw_bonus_sprite:
     push ax
+    push bx
+    push cx
     push dx
     push di
     push si
-    push bx
-    push cx
-
-    ; Check if bonus is within screen bounds
-    mov ax, cx
-    cmp ax, -16
-    jl skip_draw_bon_sprite
-    cmp ax, 200
-    jge skip_draw_bon_sprite
 
     mov si, bonus_sprite_data
-    mov dx, 0
+    mov dx, 0           ; row counter
 
 bonus_sprite_row:
+    ; Calculate screen Y position
     mov ax, cx
     add ax, dx
     cmp ax, 0
     jl skip_bonus_row
     cmp ax, 200
-    jge skip_draw_bon_sprite
+    jge bonus_sprite_done
     
     mov di, ax
     imul di, 320
     add di, bx
 
     push cx
-    mov cx, 0
+    push bx
+    mov cx, 0           ; column counter
 bonus_sprite_col:
         mov al, [si]
         inc si
@@ -1826,43 +1798,40 @@ bonus_sprite_col:
         je skip_bonus_pixel
         
         ; Check road boundaries
-        push bx
-        add bx, cx
-        cmp bx, 102
-        jl skip_bon_pixel_pop
-        cmp bx, 217
-        jg skip_bon_pixel_pop
-        pop bx
+        mov ax, bx
+        add ax, cx
+        cmp ax, 102
+        jl skip_bonus_pixel
+        cmp ax, 217
+        jg skip_bonus_pixel
         
+        ; Get back the pixel color
+        mov al, [si-1]
         mov [es:di], al
-        jmp continue_bonus_pixel
-        
-skip_bon_pixel_pop:
-        pop bx
         
 skip_bonus_pixel:
-continue_bonus_pixel:
         inc di
         inc cx
         cmp cx, BONUS_SIZE
         jl bonus_sprite_col
+    pop bx
     pop cx
-    jmp after_bonus_row
+    jmp next_bonus_row
 
 skip_bonus_row:
-    add si, BONUS_SIZE
+    add si, BONUS_SIZE  ; Skip this row's data
     
-after_bonus_row:
+next_bonus_row:
     inc dx
     cmp dx, BONUS_SIZE
     jl bonus_sprite_row
 
-skip_draw_bon_sprite:
-    pop cx
-    pop bx
+bonus_sprite_done:
     pop si
     pop di
     pop dx
+    pop cx
+    pop bx
     pop ax
     ret
 
@@ -1894,8 +1863,7 @@ check_bonus_collision:
     push si
     push di
    
-    mov al, [bonus_active]
-    cmp al, 0
+    cmp byte [bonus_active], 0
     je no_bonus_collision
    
     ; Get player bounds
@@ -1910,23 +1878,19 @@ check_bonus_collision:
     mov si, [bonus_x]
     mov di, [bonus_y]
    
-    ; Check overlap
-    ; 1. Player right <= Bonus left
+    ; Check for NO overlap
     cmp cx, si
     jle no_bonus_collision
    
-    ; 2. Player left >= Bonus right
     push si
     add si, BONUS_SIZE
     cmp ax, si
     pop si
     jge no_bonus_collision
    
-    ; 3. Player bottom <= Bonus top
     cmp dx, di
     jle no_bonus_collision
    
-    ; 4. Player top >= Bonus bottom
     push di
     add di, BONUS_SIZE
     cmp bx, di
@@ -1934,15 +1898,6 @@ check_bonus_collision:
     jge no_bonus_collision
    
     ; BONUS COLLECTED!
-    ; Erase the bonus first
-    push bx
-    push cx
-    mov bx, [bonus_x]
-    mov cx, [bonus_y]
-    call erase_bonus
-    pop cx
-    pop bx
-    
     add word [score], 50
     mov byte [bonus_active], 0
    
@@ -2017,6 +1972,7 @@ timer_done:
 ; === RESTORE TIMER ISR ===
 restore_timer_isr:
     push ax
+    push bx
     push dx
     push ds
     
@@ -2029,8 +1985,8 @@ restore_timer_isr:
     
     ; Restore original timer ISR
     mov dx, [old_timer_isr]
-    mov ax, [old_timer_isr+2]
-    mov ds, ax
+    mov bx, [old_timer_isr+2]
+    mov ds, bx
     mov ax, 2508h
     int 21h
     
@@ -2045,6 +2001,7 @@ skip_restore:
     
     pop ds
     pop dx
+    pop bx
     pop ax
     ret
 
@@ -2055,18 +2012,18 @@ display_score_ingame:
     push cx
     push dx
     push di
+    push si
     
     ; Draw score background (top-right corner)
     mov cx, 2
 score_bg_y:
-    mov dx, 270
     push cx
+    mov dx, 270
 score_bg_x:
         mov di, cx
         imul di, 320
         add di, dx
-        mov al, 8  ; black background
-        mov [es:di], al
+        mov byte [es:di], 8  ; black background
         inc dx
         cmp dx, 318
         jl score_bg_x
@@ -2088,6 +2045,7 @@ score_bg_x:
     mov dl, 35          ; column
     call print_number_small
     
+    pop si
     pop di
     pop dx
     pop cx
@@ -2102,20 +2060,15 @@ print_number_small:
     push cx
     push dx
     push si
-    push di
     
-    ; Save starting position
-    push dx
-    
-    ; Handle zero case
-    test ax, ax
-    jnz convert_start_small
-    
-    ; Display "0"
-    pop dx
+    ; Set cursor position first
     mov ah, 02h
     mov bh, 0
     int 10h
+    
+    ; Handle zero case
+    test ax, ax
+    jnz do_convert_small
     
     mov ah, 09h
     mov al, '0'
@@ -2125,55 +2078,37 @@ print_number_small:
     int 10h
     jmp print_num_small_done
     
-convert_start_small:
-    ; Convert number to string
+do_convert_small:
+    ; Convert number to string (push digits)
     mov bx, 10
-    mov cx, 0
+    xor cx, cx          ; digit counter
     
-convert_num_small_loop:
+convert_small_loop:
     xor dx, dx
     div bx
-    push dx
+    push dx             ; save digit
     inc cx
     test ax, ax
-    jnz convert_num_small_loop
+    jnz convert_small_loop
     
-    ; Get starting position back
-    pop dx              ; This is now the last digit, need position
-    push dx             ; Put it back
+    ; Now print digits
+    mov dx, cx          ; save digit count
     
-    ; We need to reconstruct the original dx value
-    ; For now, use fixed position
-    mov dh, 1
-    mov dl, 35
-    
-print_num_small_loop:
-    ; Set cursor
-    mov ah, 02h
-    mov bh, 0
-    int 10h
-    
-    pop ax              ; Get digit
+print_digits_loop:
+    pop ax              ; get digit
     add al, '0'
     
-    push cx
     push dx
-    
-    mov ah, 09h
+    push cx
+    mov ah, 0Eh         ; teletype output
     mov bh, 0
-    mov bl, 15
-    mov cx, 1
     int 10h
-    
-    pop dx
     pop cx
+    pop dx
     
-    inc dl              ; Next column
-    
-    loop print_num_small_loop
+    loop print_digits_loop
     
 print_num_small_done:
-    pop di
     pop si
     pop dx
     pop cx
