@@ -2,8 +2,6 @@
 
 A retro racing game built in x86 Assembly (DOS). Dodge oncoming cars, collect bonus items, and survive as long as possible on a 3-lane road rendered in VGA Mode 13h (320×200, 256 colors).
 
-Built for the Fall 2025 semester by Maliha (0660) and Fatima (0588).
-
 ---
 
 ## Gameplay
